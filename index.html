@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>IPL Family Bets 🏏</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <div>
+      <div class="header-title">🏏 IPL Family Bets <span class="header-badge">2026</span></div>
+      <div class="header-sub">₹100 per person · pot splits among winners</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <div id="connStatus" class="conn-status"></div>
+      <button id="adminLoginBtn" class="auth-pill" onclick="openLoginModal()">🔑 Admin</button>
+      <div id="adminBadge" class="auth-pill admin-active" style="display:none;">
+        <span>⚡ Admin</span>
+        <button onclick="doLogout()" class="logout-x" title="Sign out">✕</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-label">Matches</div><div class="stat-value" id="s-matches">—</div></div>
+    <div class="stat-card"><div class="stat-label">Top earner</div><div class="stat-value" id="s-top" style="font-size:17px;">—</div></div>
+    <div class="stat-card"><div class="stat-label">Best net</div><div class="stat-value" id="s-best">—</div></div>
+  </div>
+
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('bet')">Place Bet</button>
+    <button class="tab" onclick="switchTab('history')">History</button>
+    <button class="tab" onclick="switchTab('leaderboard')">Leaderboard</button>
+    <button class="tab" onclick="switchTab('settings')">Settings</button>
+  </div>
+
+  <!-- ══ BET TAB ══ -->
+  <div id="tab-bet">
+    <div class="alert" id="alertBox"></div>
+
+    <!-- ── GUEST FLOW ── -->
+    <div id="guestFlow">
+
+      <!-- Step 1: No matches open -->
+      <div id="noMatchGuest" class="card" style="display:none;">
+        <div class="empty">
+          <span class="empty-icon">🏏</span>
+          No matches open right now.<br>
+          <span style="font-size:12px;color:var(--text3);margin-top:6px;display:block;">Admin will set up the next match soon.</span>
+        </div>
+      </div>
+
+      <!-- Step 1: Pick a match (shown when >0 matches open) -->
+      <div id="matchSelectPanel" class="card" style="display:none;">
+        <div class="card-title">Pick a Match</div>
+        <p style="color:var(--text2);font-size:14px;margin-bottom:16px;">Select the match you want to bet on.</p>
+        <div id="matchSelectGrid" style="display:flex;flex-direction:column;gap:10px;"></div>
+      </div>
+
+      <!-- Step 2: Who are you? -->
+      <div id="identityPanel" class="card" style="display:none;">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;">
+          <button class="btn-ghost" style="padding:6px 12px;font-size:13px;" onclick="backToMatchSelect()">← Back</button>
+          <div id="identityMatchLabel" style="font-size:14px;font-weight:600;color:var(--text);"></div>
+        </div>
+        <div class="card-title" style="margin-bottom:8px;">Who are you?</div>
+        <p style="color:var(--text2);font-size:14px;margin-bottom:16px;">Tap your name to place your pick.</p>
+        <div class="identity-grid" id="identityGrid">
+          {% for m in members %}
+          <button class="identity-btn" data-name="{{ m }}" onclick="selectIdentity('{{ m }}')">
+            <span class="identity-initial">{{ m[0] }}</span>
+            <span class="identity-name">{{ m }}</span>
+          </button>
+          {% endfor %}
+        </div>
+      </div>
+
+      <!-- Step 3: Pick your team -->
+      <div id="pickPanel" class="card" style="display:none;">
+
+        <!-- Back button: goes to identity normally, or match select when revealed -->
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:18px;">
+          <button class="btn-ghost" style="padding:6px 12px;font-size:13px;" id="pickBackBtn" onclick="pickBack()">← Back</button>
+          <div>
+            <div style="font-size:16px;font-weight:600;color:var(--text);" id="pickGreeting"></div>
+            <div style="font-size:12px;color:var(--text3);" id="pickSubtitle"></div>
+          </div>
+        </div>
+
+        <!-- Revealed notice banner (shown instead of pick UI when teams_revealed) -->
+        <div id="revealedNotice" style="display:none;padding:12px 14px;margin-bottom:16px;
+             background:var(--green-bg);border:1px solid rgba(45,186,135,0.3);border-radius:var(--radius);
+             display:none;align-items:center;gap:10px;">
+          <span style="font-size:18px;">👁</span>
+          <div>
+            <div style="font-weight:600;color:var(--green);font-size:13px;">Picks are now public</div>
+            <div style="color:var(--text2);font-size:12px;margin-top:2px;">Admin has revealed everyone's team choices.</div>
+          </div>
+        </div>
+
+        <div class="pot-bar" style="margin-bottom:18px;">
+          <span class="pot-text">🫙 Current pot</span>
+          <span class="pot-amount" id="livePot">₹0</span>
+          <span class="pot-text" id="pickProgress" style="font-size:12px;margin-left:8px;"></span>
+        </div>
+
+        <!-- Already picked: show status + change button -->
+        <div id="alreadyPickedNotice" style="display:none;margin-bottom:16px;">
+          <div style="padding:16px;background:var(--green-bg);border:1px solid rgba(45,186,135,0.3);
+               border-radius:var(--radius);text-align:center;margin-bottom:10px;">
+            <div style="font-size:20px;margin-bottom:6px;">✅</div>
+            <div style="color:var(--green);font-weight:600;margin-bottom:4px;">Your pick is locked in!</div>
+            <div style="color:var(--text2);font-size:13px;" id="currentPickLabel">Waiting for the match result…</div>
+          </div>
+          <button class="btn-ghost" style="width:100%;text-align:center;" onclick="changePick()">✏️ Change my pick</button>
+        </div>
+
+        <!-- Pick buttons (hidden when teams are revealed) -->
+        <div id="guestPickButtons" style="display:none;">
+          <label class="field-label" style="margin-bottom:12px;">Pick the winner</label>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:10px;">
+            <button class="pick-big-btn" id="pickT1Btn" onclick="submitGuestPick('t1')"></button>
+            <button class="pick-big-btn" id="pickT2Btn" onclick="submitGuestPick('t2')"></button>
+          </div>
+          <button class="pick-big-btn pick-abstain-btn" id="pickNoneBtn" onclick="submitGuestPick('none')"
+                  style="width:100%;padding:14px;font-size:14px;font-family:'DM Sans',sans-serif;">
+            🤷 Not picking / Abstain
+          </button>
+        </div>
+
+        <!-- Who has picked so far -->
+        <div style="margin-top:18px;padding-top:18px;border-top:1px solid var(--border);">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+            <div class="field-label">Picked so far</div>
+            <div id="revealBanner" style="display:none;font-size:11px;font-weight:600;
+                 padding:3px 9px;border-radius:20px;background:var(--green-bg);
+                 color:var(--green);border:1px solid rgba(45,186,135,0.35);">
+              👁 Teams revealed
+            </div>
+          </div>
+          <div id="pickedSoFar" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;"></div>
+        </div>
+      </div>
+
+    </div><!-- /guestFlow -->
+
+    <!-- ══ ADMIN BET PANEL ══ -->
+    <div id="adminBetPanel" style="display:none;">
+
+      <!-- Open new match form -->
+      <div class="card" id="adminNewMatch">
+        <div class="card-title">Open New Match</div>
+        <div class="form-row" style="margin-bottom:18px;">
+          <div class="form-field">
+            <label class="field-label">Team 1</label>
+            <input type="text" id="team1" placeholder="e.g. MI" />
+          </div>
+          <div class="form-field">
+            <label class="field-label">Team 2</label>
+            <input type="text" id="team2" placeholder="e.g. CSK" />
+          </div>
+        </div>
+        <div class="form-field" style="margin-bottom:18px;">
+          <label class="field-label">Match Date</label>
+          <input type="date" id="matchDate" />
+        </div>
+        <label class="field-label">Who's betting?</label>
+        <div class="toggle-group" id="memberToggles">
+          {% for m in members %}
+          <button class="toggle-btn on" data-name="{{ m }}" onclick="toggleMember(this)">{{ m }}</button>
+          {% endfor %}
+        </div>
+        <div class="action-row">
+          <button class="btn-primary" onclick="openNewMatch()">Open Match</button>
+        </div>
+      </div>
+
+      <!-- List of active matches for admin -->
+      <div id="adminActiveMatchList"></div>
+
+    </div><!-- /adminBetPanel -->
+
+  </div><!-- /tab-bet -->
+
+  <!-- ══ HISTORY TAB ══ -->
+  <div id="tab-history" style="display:none;">
+    <div class="card" id="historyCard">
+      <div class="empty"><span class="empty-icon">⏳</span>Loading...</div>
+    </div>
+  </div>
+
+  <!-- ══ LEADERBOARD TAB ══ -->
+  <div id="tab-leaderboard" style="display:none;">
+    <div id="lbCard">
+      <div class="empty"><span class="empty-icon">⏳</span>Loading...</div>
+    </div>
+  </div>
+
+  <!-- ══ SETTINGS TAB ══ -->
+  <div id="tab-settings" style="display:none;">
+    <div id="settingsGuestNotice" class="card" style="display:none;">
+      <div class="card-title">Settings</div>
+      <div class="guest-notice">
+        <div class="guest-notice-icon">🔒</div>
+        <div>
+          <div style="font-weight:600;color:var(--text);margin-bottom:4px;">Admin access required</div>
+          <div style="font-size:13px;color:var(--text2);">Log in as admin to manage data.</div>
+        </div>
+        <button class="btn-primary" style="margin-left:auto;" onclick="openLoginModal()">Admin Login</button>
+      </div>
+    </div>
+    <div id="settingsAdminPanel" class="card" style="display:none;">
+      <div class="card-title">Danger Zone</div>
+      <p style="color:var(--text2);font-size:14px;margin-bottom:16px;">Permanently delete all match history.</p>
+      <button class="btn-ghost" style="color:var(--red);border-color:rgba(232,91,91,0.3);" onclick="clearAll()">🗑 Clear all data</button>
+    </div>
+  </div>
+
+</div><!-- /shell -->
+
+<!-- LOGIN MODAL -->
+<div id="loginOverlay" class="modal-overlay" onclick="closeLoginModal(event)">
+  <div class="modal-box" onclick="event.stopPropagation()">
+    <div class="modal-header">
+      <div class="modal-title">🔑 Admin Login</div>
+      <button class="modal-close" onclick="closeLoginModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="alert" id="loginAlert"></div>
+      <div class="form-field" style="margin-bottom:18px;">
+        <label class="field-label">Password</label>
+        <input type="password" id="adminPassword" placeholder="Enter admin password"
+               onkeydown="if(event.key==='Enter') submitLogin()" />
+      </div>
+      <button class="btn-primary" style="width:100%;" onclick="submitLogin()" id="loginBtn">Login</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/js/app.js"></script>
+</body>
+</html>

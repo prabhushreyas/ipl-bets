@@ -21,7 +21,6 @@ app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'ipl-bets-dev-secret-cha
 db = SQLAlchemy(app)
 ADMIN_PASSWORD  = os.environ.get('ADMIN_PASSWORD', 'ipl2026admin')
 ODDS_API_KEY    = os.environ.get('ODDS_API_KEY', '')
-RAPIDAPI_KEY    = os.environ.get('RAPIDAPI_KEY', '')
 
 # Map short team codes → full names used by APIs
 IPL_TEAM_NAMES = {
@@ -81,101 +80,6 @@ def fetch_odds_once(team1, team2):
     return {'team1_odds': 'N/A', 'team2_odds': 'N/A'}
 
 
-def fetch_team_stats(team1, team2):
-    """Fetch IPL season stats (form, W/L record) for both teams via Cricbuzz on RapidAPI."""
-    if not RAPIDAPI_KEY:
-        return {'team1_stats': None, 'team2_stats': None}
-    try:
-        headers = {
-            'X-RapidAPI-Key':  RAPIDAPI_KEY,
-            'X-RapidAPI-Host': 'cricbuzz-cricket.p.rapidapi.com',
-        }
-        # Get list of series to find current IPL series ID
-        series_resp = http_requests.get(
-            'https://cricbuzz-cricket.p.rapidapi.com/series/v1/international',
-            headers=headers, timeout=8
-        )
-        series_resp.raise_for_status()
-        series_data = series_resp.json()
-
-        ipl_id = None
-        for group in series_data.get('seriesMapProto', []):
-            for series in group.get('series', []):
-                if 'ipl' in series.get('name', '').lower() or 'indian premier' in series.get('name', '').lower():
-                    ipl_id = series.get('id')
-                    break
-            if ipl_id:
-                break
-
-        if not ipl_id:
-            # Try domestic series list
-            dom_resp = http_requests.get(
-                'https://cricbuzz-cricket.p.rapidapi.com/series/v1/domestic',
-                headers=headers, timeout=8
-            )
-            dom_resp.raise_for_status()
-            dom_data = dom_resp.json()
-            for group in dom_data.get('seriesMapProto', []):
-                for series in group.get('series', []):
-                    if 'ipl' in series.get('name', '').lower():
-                        ipl_id = series.get('id')
-                        break
-                if ipl_id:
-                    break
-
-        if not ipl_id:
-            return {'team1_stats': None, 'team2_stats': None}
-
-        # Get matches for the IPL series
-        matches_resp = http_requests.get(
-            f'https://cricbuzz-cricket.p.rapidapi.com/series/v1/{ipl_id}/matches',
-            headers=headers, timeout=8
-        )
-        matches_resp.raise_for_status()
-        match_list = matches_resp.json()
-
-        def calc_stats(team_code):
-            full = expand_team(team_code)
-            wins, losses, form = 0, 0, []
-            for match_item in match_list.get('matchDetails', []):
-                for match in match_item.get('matchDetailsMap', {}).get('match', []):
-                    info = match.get('matchInfo', {})
-                    result = match.get('matchScore', {})
-                    state = info.get('state', '')
-                    if state != 'Complete':
-                        continue
-                    t1_name = info.get('team1', {}).get('teamName', '')
-                    t2_name = info.get('team2', {}).get('teamName', '')
-                    involved = (team_code.upper() in t1_name.upper() or team_code.upper() in t2_name.upper() or
-                                full.lower() in t1_name.lower() or full.lower() in t2_name.lower())
-                    if not involved:
-                        continue
-                    winner_id = info.get('matchWinner', '')
-                    t1_id = str(info.get('team1', {}).get('teamId', ''))
-                    t2_id = str(info.get('team2', {}).get('teamId', ''))
-                    team_id = t1_id if (team_code.upper() in t1_name.upper() or full.lower() in t1_name.lower()) else t2_id
-                    if str(winner_id) == team_id:
-                        wins += 1
-                        form.append('W')
-                    else:
-                        losses += 1
-                        form.append('L')
-
-            form_last5 = form[-5:] if len(form) >= 5 else form
-            return {
-                'wins':   wins,
-                'losses': losses,
-                'played': wins + losses,
-                'form':   ' '.join(form_last5) if form_last5 else 'No data',
-            }
-
-        return {
-            'team1_stats': calc_stats(team1),
-            'team2_stats': calc_stats(team2),
-        }
-    except Exception as e:
-        print(f'[stats] fetch failed: {e}')
-    return {'team1_stats': None, 'team2_stats': None}
 
 def admin_required(f):
     @wraps(f)
@@ -248,7 +152,6 @@ class ActiveMatch(db.Model):
             'i_have_picked':  (viewer_name in picks_data) if viewer_name else False,
             'team1_odds':     meta.get('team1_odds', 'N/A'),
             'team2_odds':     meta.get('team2_odds', 'N/A'),
-            'match_stats':    meta.get('match_stats', None),
         }
 
 
@@ -379,15 +282,13 @@ def create_active_match():
     if not t1 or not t2:
         return jsonify({'error': 'Both team names required'}), 400
 
-    # Fetch odds and stats once — store in picks under reserved '_meta' key
+    # Fetch odds once — store in picks under reserved '_meta' key
     # This avoids any DB migration (no new columns needed)
-    odds  = fetch_odds_once(t1, t2)
-    stats = fetch_team_stats(t1, t2)
-    meta  = {
+    odds = fetch_odds_once(t1, t2)
+    meta = {
         '_meta': {
-            'team1_odds':  odds['team1_odds'],
-            'team2_odds':  odds['team2_odds'],
-            'match_stats': stats,
+            'team1_odds': odds['team1_odds'],
+            'team2_odds': odds['team2_odds'],
         }
     }
 

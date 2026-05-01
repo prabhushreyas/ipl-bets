@@ -1,538 +1,836 @@
-from flask import Flask, jsonify, request, render_template, redirect, url_for, session
-from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
-from datetime import datetime
-from functools import wraps
-import os
-import json
-import requests as http_requests
+/* ── State ───────────────────────────────────────────────────────────────── */
+const API      = '';
+let currentRole    = 'guest';
+let allMembers     = [];
+let myName         = null;   // selected identity
+let selectedMatch  = null;   // selected active match object
+let activeMatches  = [];     // all open matches
+let adminWinners   = {};     // {matchId: 't1'|'t2'|'none'}
 
-app = Flask(__name__)
-CORS(app)
+/* ── Bootstrap ───────────────────────────────────────────────────────────── */
+window.addEventListener('DOMContentLoaded', async () => {
+  allMembers = [...document.querySelectorAll('#memberToggles .toggle-btn')].map(b => b.dataset.name);
+  const today = new Date().toISOString().split('T')[0];
+  const dateEl = document.getElementById('matchDate');
+  if (dateEl) dateEl.value = today;
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
-    'DATABASE_URL',
-    f'sqlite:///{os.path.join(BASE_DIR, "ipl_bets.db")}'
-).replace('postgres://', 'postgresql://')
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'ipl-bets-dev-secret-change-me')
+  await syncRole();
+  await loadStats();
+  setConnStatus(true);
+});
 
-db = SQLAlchemy(app)
-ADMIN_PASSWORD  = os.environ.get('ADMIN_PASSWORD', 'ipl2026admin')
-ODDS_API_KEY    = os.environ.get('ODDS_API_KEY', '')
-RAPIDAPI_KEY    = os.environ.get('RAPIDAPI_KEY', '')
-
-# Map short team codes → full names used by APIs
-IPL_TEAM_NAMES = {
-    'MI':   'Mumbai Indians',
-    'CSK':  'Chennai Super Kings',
-    'RCB':  'Royal Challengers Bengaluru',
-    'KKR':  'Kolkata Knight Riders',
-    'DC':   'Delhi Capitals',
-    'SRH':  'Sunrisers Hyderabad',
-    'RR':   'Rajasthan Royals',
-    'PBKS': 'Punjab Kings',
-    'GT':   'Gujarat Titans',
-    'LSG':  'Lucknow Super Giants',
+/* ── Role ────────────────────────────────────────────────────────────────── */
+async function syncRole() {
+  try {
+    const data = await apiFetch('/api/me');
+    currentRole = data.role || 'guest';
+  } catch (_) { currentRole = 'guest'; }
+  await applyRoleUI();
 }
 
-def expand_team(code):
-    return IPL_TEAM_NAMES.get(code.upper(), code)
-
-def fetch_odds_once(team1, team2):
-    """Fetch win probability % for each team from The Odds API — called once when match opens."""
-    if not ODDS_API_KEY:
-        return {'team1_odds': 'N/A', 'team2_odds': 'N/A'}
-    try:
-        url = (
-            'https://api.the-odds-api.com/v4/sports/cricket_ipl/odds/'
-            f'?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal'
-        )
-        resp = http_requests.get(url, timeout=8)
-        resp.raise_for_status()
-        matches = resp.json()
-
-        t1_full = expand_team(team1).lower()
-        t2_full = expand_team(team2).lower()
-
-        for m in matches:
-            home = m.get('home_team', '').lower()
-            away = m.get('away_team', '').lower()
-            if (t1_full in home or t1_full in away or team1.lower() in home or team1.lower() in away):
-                bookmakers = m.get('bookmakers', [])
-                if not bookmakers:
-                    break
-                outcomes = bookmakers[0]['markets'][0]['outcomes']
-                odds_map = {o['name'].lower(): o['price'] for o in outcomes}
-
-                def win_pct(name):
-                    for k, v in odds_map.items():
-                        if name.lower() in k:
-                            return str(round((1 / v) * 100)) + '%'
-                    return 'N/A'
-
-                return {
-                    'team1_odds': win_pct(t1_full) if win_pct(t1_full) != 'N/A' else win_pct(team1),
-                    'team2_odds': win_pct(t2_full) if win_pct(t2_full) != 'N/A' else win_pct(team2),
-                }
-    except Exception as e:
-        print(f'[odds] fetch failed: {e}')
-    return {'team1_odds': 'N/A', 'team2_odds': 'N/A'}
-
-
-def fetch_team_stats(team1, team2):
-    """Fetch IPL season stats (form, W/L record) for both teams via Cricbuzz on RapidAPI."""
-    if not RAPIDAPI_KEY:
-        return {'team1_stats': None, 'team2_stats': None}
-    try:
-        headers = {
-            'X-RapidAPI-Key':  RAPIDAPI_KEY,
-            'X-RapidAPI-Host': 'cricbuzz-cricket.p.rapidapi.com',
-        }
-        # Get list of series to find current IPL series ID
-        series_resp = http_requests.get(
-            'https://cricbuzz-cricket.p.rapidapi.com/series/v1/international',
-            headers=headers, timeout=8
-        )
-        series_resp.raise_for_status()
-        series_data = series_resp.json()
-
-        ipl_id = None
-        for group in series_data.get('seriesMapProto', []):
-            for series in group.get('series', []):
-                if 'ipl' in series.get('name', '').lower() or 'indian premier' in series.get('name', '').lower():
-                    ipl_id = series.get('id')
-                    break
-            if ipl_id:
-                break
-
-        if not ipl_id:
-            # Try domestic series list
-            dom_resp = http_requests.get(
-                'https://cricbuzz-cricket.p.rapidapi.com/series/v1/domestic',
-                headers=headers, timeout=8
-            )
-            dom_resp.raise_for_status()
-            dom_data = dom_resp.json()
-            for group in dom_data.get('seriesMapProto', []):
-                for series in group.get('series', []):
-                    if 'ipl' in series.get('name', '').lower():
-                        ipl_id = series.get('id')
-                        break
-                if ipl_id:
-                    break
-
-        if not ipl_id:
-            return {'team1_stats': None, 'team2_stats': None}
-
-        # Get matches for the IPL series
-        matches_resp = http_requests.get(
-            f'https://cricbuzz-cricket.p.rapidapi.com/series/v1/{ipl_id}/matches',
-            headers=headers, timeout=8
-        )
-        matches_resp.raise_for_status()
-        match_list = matches_resp.json()
-
-        def calc_stats(team_code):
-            full = expand_team(team_code)
-            wins, losses, form = 0, 0, []
-            for match_item in match_list.get('matchDetails', []):
-                for match in match_item.get('matchDetailsMap', {}).get('match', []):
-                    info = match.get('matchInfo', {})
-                    result = match.get('matchScore', {})
-                    state = info.get('state', '')
-                    if state != 'Complete':
-                        continue
-                    t1_name = info.get('team1', {}).get('teamName', '')
-                    t2_name = info.get('team2', {}).get('teamName', '')
-                    involved = (team_code.upper() in t1_name.upper() or team_code.upper() in t2_name.upper() or
-                                full.lower() in t1_name.lower() or full.lower() in t2_name.lower())
-                    if not involved:
-                        continue
-                    winner_id = info.get('matchWinner', '')
-                    t1_id = str(info.get('team1', {}).get('teamId', ''))
-                    t2_id = str(info.get('team2', {}).get('teamId', ''))
-                    team_id = t1_id if (team_code.upper() in t1_name.upper() or full.lower() in t1_name.lower()) else t2_id
-                    if str(winner_id) == team_id:
-                        wins += 1
-                        form.append('W')
-                    else:
-                        losses += 1
-                        form.append('L')
-
-            form_last5 = form[-5:] if len(form) >= 5 else form
-            return {
-                'wins':   wins,
-                'losses': losses,
-                'played': wins + losses,
-                'form':   ' '.join(form_last5) if form_last5 else 'No data',
-            }
-
-        return {
-            'team1_stats': calc_stats(team1),
-            'team2_stats': calc_stats(team2),
-        }
-    except Exception as e:
-        print(f'[stats] fetch failed: {e}')
-    return {'team1_stats': None, 'team2_stats': None}
-
-def admin_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if session.get('role') != 'admin':
-            if request.path.startswith('/api/'):
-                return jsonify({'error': 'Admin access required'}), 403
-            return redirect(url_for('index'))
-        return f(*args, **kwargs)
-    return decorated
-
-# ── Models ───────────────────────────────────────────────────────────────────
-class Match(db.Model):
-    __tablename__ = 'matches'
-    id          = db.Column(db.Integer, primary_key=True)
-    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
-    match_date  = db.Column(db.String(20), nullable=False)
-    team1       = db.Column(db.String(50), nullable=False)
-    team2       = db.Column(db.String(50), nullable=False)
-    winner_team = db.Column(db.String(10), nullable=False)
-    winner_name = db.Column(db.String(50), nullable=False)
-    pot         = db.Column(db.Integer, nullable=False)
-    bettors     = db.Column(db.Text, nullable=False)
-    picks       = db.Column(db.Text, nullable=False)
-    payouts     = db.Column(db.Text, nullable=False)
-    seeded      = db.Column(db.Boolean, default=False)
-
-    def to_dict(self):
-        return {
-            'id': self.id, 'match_date': self.match_date,
-            'team1': self.team1, 'team2': self.team2,
-            'winner_team': self.winner_team, 'winner_name': self.winner_name,
-            'pot': self.pot, 'bettors': json.loads(self.bettors),
-            'picks': json.loads(self.picks), 'payouts': json.loads(self.payouts),
-            'seeded': self.seeded,
-        }
-
-
-class ActiveMatch(db.Model):
-    """A pending match open for picking. Multiple can coexist."""
-    __tablename__ = 'active_match'
-    id             = db.Column(db.Integer, primary_key=True)
-    match_date     = db.Column(db.String(20), nullable=False)
-    team1          = db.Column(db.String(50), nullable=False)
-    team2          = db.Column(db.String(50), nullable=False)
-    picks          = db.Column(db.Text, nullable=False, default='{}')
-    bettors        = db.Column(db.Text, nullable=False, default='[]')
-    teams_revealed = db.Column(db.Boolean, nullable=False, default=False)
-    team1_odds     = db.Column(db.String(20), nullable=True)   # e.g. "58%"
-    team2_odds     = db.Column(db.String(20), nullable=True)   # e.g. "42%"
-    match_stats    = db.Column(db.Text, nullable=True)         # JSON string
-
-    def to_dict(self, is_admin=False, viewer_name=None):
-        picks_data = json.loads(self.picks)
-        bettors    = json.loads(self.bettors)
-        show_picks = is_admin or self.teams_revealed
-        stats = None
-        if self.match_stats:
-            try: stats = json.loads(self.match_stats)
-            except: pass
-        return {
-            'id':             self.id,
-            'match_date':     self.match_date,
-            'team1':          self.team1,
-            'team2':          self.team2,
-            'bettors':        bettors,
-            'picked_count':   len(picks_data),
-            'total_bettors':  len(bettors),
-            'pot':            len(picks_data) * 100,
-            'picked_names':   list(picks_data.keys()),
-            'picks':          picks_data if show_picks else {},
-            'teams_revealed': self.teams_revealed,
-            'i_have_picked':  (viewer_name in picks_data) if viewer_name else False,
-            'team1_odds':     self.team1_odds or 'N/A',
-            'team2_odds':     self.team2_odds or 'N/A',
-            'match_stats':    stats,
-        }
-
-
-MEMBERS = ['Umesh', 'Sheetal', 'Shreyas', 'Shreshta']
-
-SEED_MATCHES = [
-    {'match': 'RCB vs SRH',  'w': 'SRH',  'p': {'Umesh': -100, 'Sheetal':  33.33, 'Shreyas':  33.33, 'Shreshta':  33.34}},
-    {'match': 'MI vs KKR',   'w': 'MI',   'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas': -100, 'Shreshta':  33.34}},
-    {'match': 'RR vs CSK',   'w': 'CSK',  'p': {'Umesh': -100, 'Sheetal': -100, 'Shreyas': 100, 'Shreshta': 100}},
-    {'match': 'GT vs PBKS',  'w': 'GT',   'p': {'Umesh': -100, 'Sheetal':  100, 'Shreyas': 100, 'Shreshta': -100}},
-    {'match': 'LSG vs DC',   'w': 'LSG',  'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas': -100, 'Shreshta':  33.34}},
-    {'match': 'SRH vs KKR',  'w': 'SRH',  'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas':  33.34, 'Shreshta': -100}},
-    {'match': 'CSK vs PBKS', 'w': 'CSK',  'p': {'Umesh': -100, 'Sheetal': -100, 'Shreyas': 300, 'Shreshta': -100}},
-    {'match': 'MI vs DC',    'w': 'MI',   'p': {'Umesh': -100, 'Sheetal':  100, 'Shreyas': 100, 'Shreshta': -100}},
-    {'match': 'RR vs GT',    'w': 'RR',   'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas':  33.34, 'Shreshta': -100}},
-    {'match': 'SRH vs LSG',  'w': 'SRH',  'p': {'Umesh': -100, 'Sheetal': -100, 'Shreyas': 100, 'Shreshta': 100}},
-    {'match': 'RCB vs CSK',  'w': 'CSK',  'p': {'Umesh': -100, 'Sheetal':  100, 'Shreyas': 100, 'Shreshta': -100}},
-    {'match': 'RR vs MI',    'w': 'MI',   'p': {'Umesh': -100, 'Sheetal':  300, 'Shreyas': -100, 'Shreshta': -100}},
-    {'match': 'GT vs DC',    'w': 'DC',   'p': {'Umesh': -100, 'Sheetal': -100, 'Shreyas': -100, 'Shreshta': 300}},
-    {'match': 'KKR vs LSG',  'w': 'KKR',  'p': {'Umesh': -100, 'Sheetal':  300, 'Shreyas': -100, 'Shreshta': -100}},
-    {'match': 'RCB vs RR',   'w': 'RCB',  'p': {'Umesh':  100, 'Sheetal': -100, 'Shreyas': -100, 'Shreshta': 100}},
-    {'match': 'SRH vs PBKS', 'w': 'SRH',  'p': {'Umesh':  300, 'Sheetal': -100, 'Shreyas': -100, 'Shreshta': -100}},
-    {'match': 'CSK vs DC',   'w': '—',    'p': {'Umesh':    0, 'Sheetal':    0, 'Shreyas':   0, 'Shreshta':   0}},
-    {'match': 'LSG vs GT',   'w': 'LSG',  'p': {'Umesh':  100, 'Sheetal': -100, 'Shreyas': -100, 'Shreshta': 100}},
-    {'match': 'RCB vs MI',   'w': 'MI',   'p': {'Umesh': -100, 'Sheetal':  100, 'Shreyas': 100, 'Shreshta': -100}},
-    {'match': 'SRH vs RR',   'w': 'RR',   'p': {'Umesh': -100, 'Sheetal': -100, 'Shreyas': -100, 'Shreshta': 300}},
-    {'match': 'CSK vs KKR',  'w': 'KKR',  'p': {'Umesh': -100, 'Sheetal':  100, 'Shreyas': 100, 'Shreshta': -100}},
-    {'match': 'LSG vs RCB',  'w': 'RCB',  'p': {'Umesh': -100, 'Sheetal':  33.33, 'Shreyas':  33.33, 'Shreshta':  33.34}},
-    {'match': 'MI vs PBKS',  'w': 'MI',   'p': {'Umesh': -100, 'Sheetal':  300, 'Shreyas': -100, 'Shreshta': -100}},
-    {'match': 'GT vs KKR',   'w': 'KKR',  'p': {'Umesh': -100, 'Sheetal':  33.33, 'Shreyas':  33.33, 'Shreshta':  33.34}},
-    {'match': 'RCB vs DC',   'w': 'DC',   'p': {'Umesh': -100, 'Sheetal': -100, 'Shreyas': -100, 'Shreshta': 300}},
-    {'match': 'SRH vs CSK',  'w': 'SRH',  'p': {'Umesh': -100, 'Sheetal':  33.33, 'Shreyas':  33.33, 'Shreshta':  33.34}},
-    {'match': 'RR vs KKR',   'w': 'RR',   'p': {'Umesh':  100, 'Sheetal': -100, 'Shreyas': -100, 'Shreshta': 100}},
-    {'match': 'PBKS vs LSG', 'w': 'PBKS', 'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas':  33.34, 'Shreshta': -100}},
-    {'match': 'MI vs GT',    'w': 'GT',   'p': {'Umesh':  33.33, 'Sheetal': -100, 'Shreyas':  33.33, 'Shreshta':  33.34}},
-    {'match': 'SRH vs DC',   'w': 'SRH',  'p': {'Umesh':  100, 'Sheetal': -100, 'Shreyas': -100, 'Shreshta': 100}},
-    {'match': 'RR vs LSG',   'w': 'RR',   'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas': -100, 'Shreshta':  33.34}},
-    {'match': 'MI vs CSK',   'w': 'CSK',  'p': {'Umesh': -100, 'Sheetal':  100, 'Shreyas': 100, 'Shreshta': -100}},
-    {'match': 'RCB vs GT',   'w': 'GT',   'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas':  33.34, 'Shreshta': -100}},
-    {'match': 'PBKS vs DC',  'w': 'PBKS', 'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas':  33.34, 'Shreshta': -100}},
-    {'match': 'RR vs SRH',   'w': 'RR',   'p': {'Umesh':  33.33, 'Sheetal':  33.33, 'Shreyas':  33.34, 'Shreshta': -100}},
-]
-
-
-def seed_database():
-    if Match.query.count() > 0:
-        return
-    for s in SEED_MATCHES:
-        t1, t2    = s['match'].split(' vs ')
-        bettors   = list(s['p'].keys())
-        picks_map = {m: ('t1' if s['p'][m] > -100 else 't2') for m in bettors}
-        m = Match(
-            match_date='2026-03-22', team1=t1, team2=t2,
-            winner_team='t1', winner_name=s['w'],
-            pot=len(bettors) * 100,
-            bettors=json.dumps(bettors), picks=json.dumps(picks_map),
-            payouts=json.dumps(s['p']), seeded=True,
-        )
-        db.session.add(m)
-    db.session.commit()
-
-
-def get_rounded_nets():
-    nets = {m: 0.0 for m in MEMBERS}
-    for match in Match.query.all():
-        payouts = json.loads(match.payouts)
-        for m in json.loads(match.bettors):
-            nets[m] += payouts.get(m, 0)
-    return {m: round(v) for m, v in nets.items()}
-
-
-def compute_payouts(bettors, picks, winner_t, t1, t2):
-    pot     = len(bettors) * 100
-    winners = [m for m in bettors if picks.get(m) == winner_t]
-    losers  = [m for m in bettors if picks.get(m) != winner_t]
-    payouts = {}
-    if winner_t == 'none' or not winners:
-        for m in bettors: payouts[m] = 0
-        winner_name = '—'
-    else:
-        winner_name = t1 if winner_t == 't1' else t2
-        share = round(pot / len(winners) - 100, 2)
-        for m in losers:  payouts[m] = -100
-        for m in winners: payouts[m] = share
-    return payouts, winner_name
-
-
-# ── Auth routes ───────────────────────────────────────────────────────────────
-@app.route('/api/login', methods=['POST'])
-def do_login():
-    data = request.get_json(force=True)
-    if data.get('password', '') != ADMIN_PASSWORD:
-        return jsonify({'error': 'Invalid password'}), 401
-    session['role'] = 'admin'
-    return jsonify({'role': 'admin'})
-
-@app.route('/api/logout', methods=['POST'])
-def do_logout():
-    session.clear()
-    return jsonify({'ok': True})
-
-@app.route('/api/me')
-def me():
-    return jsonify({'role': session.get('role', 'guest')})
-
-@app.route('/')
-def index():
-    return render_template('index.html', members=MEMBERS, role=session.get('role', 'guest'))
-
-
-# ── Active matches ────────────────────────────────────────────────────────────
-@app.route('/api/active-matches', methods=['GET'])
-def get_active_matches():
-    is_admin    = session.get('role') == 'admin'
-    viewer_name = request.args.get('name', '')
-    matches     = ActiveMatch.query.order_by(ActiveMatch.id).all()
-    return jsonify([m.to_dict(is_admin=is_admin, viewer_name=viewer_name) for m in matches])
-
-
-@app.route('/api/active-matches', methods=['POST'])
-@admin_required
-def create_active_match():
-    data    = request.get_json(force=True)
-    t1      = data.get('team1', '').strip()
-    t2      = data.get('team2', '').strip()
-    date    = data.get('match_date', datetime.utcnow().strftime('%Y-%m-%d'))
-    bettors = data.get('bettors', MEMBERS)
-    if not t1 or not t2:
-        return jsonify({'error': 'Both team names required'}), 400
-
-    # Fetch odds and stats once at match creation
-    odds  = fetch_odds_once(t1, t2)
-    stats = fetch_team_stats(t1, t2)
-
-    am = ActiveMatch(
-        match_date=date, team1=t1, team2=t2,
-        picks=json.dumps({}), bettors=json.dumps(bettors),
-        team1_odds=odds['team1_odds'],
-        team2_odds=odds['team2_odds'],
-        match_stats=json.dumps(stats),
-    )
-    db.session.add(am)
-    db.session.commit()
-    return jsonify(am.to_dict(is_admin=True)), 201
-
-
-@app.route('/api/active-matches/<int:match_id>/pick', methods=['POST'])
-def submit_pick(match_id):
-    am      = ActiveMatch.query.get_or_404(match_id)
-    data    = request.get_json(force=True)
-    name    = data.get('name', '').strip()
-    choice  = data.get('pick', '')
-    bettors = json.loads(am.bettors)
-
-    if name not in MEMBERS:
-        return jsonify({'error': 'Unknown name'}), 400
-    if name not in bettors:
-        return jsonify({'error': 'You are not in this match'}), 400
-    if choice not in ('t1', 't2', 'none'):
-        return jsonify({'error': 'Pick must be t1, t2, or none'}), 400
-
-    picks       = json.loads(am.picks)
-    is_change   = name in picks
-    picks[name] = choice
-    am.picks    = json.dumps(picks)
-    db.session.commit()
-
-    return jsonify({
-        'ok': True, 'is_change': is_change,
-        'picked_count': len(picks), 'total_bettors': len(bettors),
-        'pot': len(picks) * 100, 'picked_names': list(picks.keys()),
-    })
-
-
-@app.route('/api/active-matches/<int:match_id>/finalize', methods=['POST'])
-@admin_required
-def finalize_match(match_id):
-    am       = ActiveMatch.query.get_or_404(match_id)
-    data     = request.get_json(force=True)
-    winner_t = data.get('winner_team')
-    if winner_t not in ('t1', 't2', 'none'):
-        return jsonify({'error': 'winner_team must be t1, t2, or none'}), 400
-
-    picks          = json.loads(am.picks)
-    bettors        = json.loads(am.bettors)
-    active_bettors = [m for m in bettors if m in picks]
-    if not active_bettors:
-        return jsonify({'error': 'No one has picked yet'}), 400
-
-    payouts, winner_name = compute_payouts(active_bettors, picks, winner_t, am.team1, am.team2)
-    match = Match(
-        match_date=am.match_date, team1=am.team1, team2=am.team2,
-        winner_team=winner_t, winner_name=winner_name,
-        pot=len(active_bettors) * 100,
-        bettors=json.dumps(active_bettors), picks=json.dumps(picks),
-        payouts=json.dumps(payouts), seeded=False,
-    )
-    db.session.add(match)
-    db.session.delete(am)
-    db.session.commit()
-    return jsonify(match.to_dict())
-
-
-@app.route('/api/active-matches/<int:match_id>/reveal', methods=['PATCH'])
-@admin_required
-def toggle_reveal(match_id):
-    am = ActiveMatch.query.get_or_404(match_id)
-    data = request.get_json(force=True)
-    am.teams_revealed = bool(data.get('revealed', False))
-    db.session.commit()
-    return jsonify({'ok': True, 'teams_revealed': am.teams_revealed})
-
-
-@app.route('/api/active-matches/<int:match_id>', methods=['DELETE'])
-@admin_required
-def cancel_active_match(match_id):
-    am = ActiveMatch.query.get_or_404(match_id)
-    db.session.delete(am)
-    db.session.commit()
-    return jsonify({'ok': True})
-
-
-# ── Completed matches ─────────────────────────────────────────────────────────
-@app.route('/api/matches', methods=['GET'])
-def get_matches():
-    return jsonify([m.to_dict() for m in Match.query.order_by(Match.id.desc()).all()])
-
-@app.route('/api/matches/<int:match_id>', methods=['DELETE'])
-@admin_required
-def delete_match(match_id):
-    match = Match.query.get_or_404(match_id)
-    db.session.delete(match); db.session.commit()
-    return jsonify({'deleted': match_id})
-
-@app.route('/api/matches/clear', methods=['DELETE'])
-@admin_required
-def clear_all():
-    Match.query.delete(); db.session.commit()
-    return jsonify({'cleared': True})
-
-
-@app.route('/api/stats')
-def get_stats():
-    nets        = get_rounded_nets()
-    total       = Match.query.count()
-    sorted_nets = sorted(nets.items(), key=lambda x: -x[1])
-    top         = sorted_nets[0] if sorted_nets else (None, 0)
-    games_by = {m: 0 for m in MEMBERS}
-    wins_by  = {m: 0 for m in MEMBERS}
-    loss_by  = {m: 0 for m in MEMBERS}
-    for match in Match.query.all():
-        bettors = json.loads(match.bettors)
-        payouts = json.loads(match.payouts)
-        for m in bettors:
-            games_by[m] += 1
-            if payouts.get(m, 0) > 0:   wins_by[m] += 1
-            elif payouts.get(m, 0) < 0: loss_by[m] += 1
-    leaderboard = sorted([{
-        'name': m, 'net': nets.get(m, 0), 'games': games_by[m],
-        'wins': wins_by[m], 'losses': loss_by[m],
-        'win_pct': round(wins_by[m] / games_by[m] * 100) if games_by[m] else 0,
-    } for m in MEMBERS], key=lambda x: -x['net'])
-    return jsonify({
-        'total_matches': total, 'top_earner': top[0], 'best_net': top[1],
-        'nets': nets, 'leaderboard': leaderboard,
-    })
-
-@app.route('/api/members')
-def get_members():
-    return jsonify(MEMBERS)
-
-@app.route('/health')
-def health():
-    return jsonify({'status': 'ok'})
-
-
-with app.app_context():
-    db.create_all()
-    seed_database()
-
-if __name__ == '__main__':
-    port  = int(os.environ.get('PORT', 5001))
-    debug = os.environ.get('FLASK_ENV', 'development') == 'development'
-    app.run(host='0.0.0.0', port=port, debug=debug)
+async function applyRoleUI() {
+  const isAdmin = currentRole === 'admin';
+  document.getElementById('adminLoginBtn').style.display = isAdmin ? 'none' : 'flex';
+  document.getElementById('adminBadge').style.display    = isAdmin ? 'flex' : 'none';
+  if (isAdmin) {
+    document.getElementById('guestFlow').style.display    = 'none';
+    document.getElementById('adminBetPanel').style.display = 'block';
+    await renderAdminBetTab();
+  } else {
+    document.getElementById('guestFlow').style.display    = 'block';
+    document.getElementById('adminBetPanel').style.display = 'none';
+    await renderGuestBetTab();
+  }
+}
+
+/* ── API helpers ─────────────────────────────────────────────────────────── */
+async function apiFetch(path, opts = {}) {
+  const res = await fetch(API + path, {
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    ...opts,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'HTTP ' + res.status);
+  }
+  return res.json();
+}
+
+function setConnStatus(ok) {
+  const el = document.getElementById('connStatus');
+  el.textContent = ok ? '● Connected' : '● Offline';
+  el.className   = 'conn-status ' + (ok ? 'ok' : 'err');
+}
+
+/* ── Stats ───────────────────────────────────────────────────────────────── */
+async function loadStats() {
+  try {
+    const s = await apiFetch('/api/stats');
+    document.getElementById('s-matches').textContent = s.total_matches;
+    document.getElementById('s-top').textContent     = s.top_earner || '—';
+    const bestEl = document.getElementById('s-best');
+    const best   = s.best_net || 0;
+    bestEl.textContent = (best >= 0 ? '+₹' : '-₹') + Math.abs(best);
+    bestEl.className   = 'stat-value ' + (best > 0 ? 'green' : best < 0 ? 'red' : '');
+    setConnStatus(true);
+  } catch (e) { setConnStatus(false); }
+}
+
+/* ── Tabs ────────────────────────────────────────────────────────────────── */
+function switchTab(t) {
+  ['bet', 'history', 'leaderboard', 'settings'].forEach((x, i) => {
+    document.getElementById('tab-' + x).style.display = x === t ? 'block' : 'none';
+    document.querySelectorAll('.tab')[i].classList.toggle('active', x === t);
+  });
+  if (t === 'history')     renderHistory();
+  if (t === 'leaderboard') renderLeaderboard();
+  if (t === 'settings')    renderSettings();
+}
+
+function renderSettings() {
+  const isAdmin = currentRole === 'admin';
+  document.getElementById('settingsGuestNotice').style.display = isAdmin ? 'none'  : 'block';
+  document.getElementById('settingsAdminPanel').style.display  = isAdmin ? 'block' : 'none';
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   GUEST FLOW  — 3 steps: match → name → pick
+══════════════════════════════════════════════════════════════════════════════ */
+
+async function renderGuestBetTab() {
+  try {
+    const qs = myName ? '?name=' + encodeURIComponent(myName) : '';
+    activeMatches = await apiFetch('/api/active-matches' + qs);
+  } catch (_) { activeMatches = []; }
+
+  if (!activeMatches.length) {
+    showOnly('noMatchGuest');
+    return;
+  }
+
+  // If we had a selected match, refresh it
+  if (selectedMatch) {
+    const refreshed = activeMatches.find(m => m.id === selectedMatch.id);
+    if (refreshed) selectedMatch = refreshed;
+    else { selectedMatch = null; myName = null; }
+  }
+
+  if (!selectedMatch) {
+    showGuestStep('matchSelectPanel');
+    renderMatchSelectGrid();
+  } else if (selectedMatch.teams_revealed) {
+    showGuestStep('pickPanel');
+    renderPickPanel();
+  } else if (!myName) {
+    showGuestStep('identityPanel');
+    renderIdentityPanel();
+  } else {
+    showGuestStep('pickPanel');
+    renderPickPanel();
+  }
+}
+
+function showOnly(id) {
+  ['noMatchGuest', 'matchSelectPanel', 'identityPanel', 'pickPanel'].forEach(x => {
+    document.getElementById(x).style.display = 'none';
+  });
+  document.getElementById(id).style.display = 'block';
+}
+
+function showGuestStep(id) { showOnly(id); }
+
+function renderMatchSelectGrid() {
+  const grid = document.getElementById('matchSelectGrid');
+  grid.innerHTML = activeMatches.map(m => {
+    const date  = fmtDate(m.match_date);
+    const prog  = m.picked_count + '/' + m.total_bettors + ' picked';
+    const revealedBadge = m.teams_revealed
+      ? '<span style="font-size:11px;font-weight:600;padding:2px 8px;border-radius:20px;' +
+        'background:var(--green-bg);color:var(--green);border:1px solid rgba(45,186,135,0.35);' +
+        'margin-left:8px;">👁 Revealed</span>'
+      : '';
+    return `
+      <button class="match-select-btn" onclick="selectMatch(${m.id})">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+          <div>
+            <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:700;color:var(--text);display:flex;align-items:center;flex-wrap:wrap;gap:4px;">
+              ${m.team1} <span style="color:var(--text3);font-weight:400;">vs</span> ${m.team2}${revealedBadge}
+            </div>
+            <div style="font-size:12px;color:var(--text3);margin-top:3px;">${date}</div>
+          </div>
+          <div style="text-align:right;flex-shrink:0;">
+            <div style="font-family:'Syne',sans-serif;font-size:15px;font-weight:700;color:var(--green);">₹${m.pot}</div>
+            <div style="font-size:11px;color:var(--text3);margin-top:2px;">${prog}</div>
+          </div>
+        </div>
+      </button>`;
+  }).join('');
+}
+
+function selectMatch(id) {
+  selectedMatch = activeMatches.find(m => m.id === id) || null;
+  myName = null;
+  if (selectedMatch && selectedMatch.teams_revealed) {
+    showGuestStep('pickPanel');
+    renderPickPanel();
+  } else {
+    showGuestStep('identityPanel');
+    renderIdentityPanel();
+  }
+}
+
+function backToMatchSelect() {
+  selectedMatch = null;
+  myName = null;
+  showGuestStep('matchSelectPanel');
+  renderMatchSelectGrid();
+}
+
+function renderIdentityPanel() {
+  if (!selectedMatch) return;
+  document.getElementById('identityMatchLabel').textContent =
+    selectedMatch.team1 + ' vs ' + selectedMatch.team2;
+}
+
+function selectIdentity(name) {
+  myName = name;
+  // Refresh match with viewer context
+  apiFetch('/api/active-matches?name=' + encodeURIComponent(name)).then(matches => {
+    const fresh = matches.find(m => m.id === selectedMatch.id);
+    if (fresh) selectedMatch = fresh;
+    showGuestStep('pickPanel');
+    renderPickPanel();
+  });
+}
+
+function backToIdentity() {
+  myName = null;
+  showGuestStep('identityPanel');
+  renderIdentityPanel();
+}
+
+function pickBack() {
+  // If teams are revealed, skip identity panel and go back to match select
+  if (selectedMatch && selectedMatch.teams_revealed) {
+    backToMatchSelect();
+  } else {
+    backToIdentity();
+  }
+}
+
+function renderPickPanel() {
+  if (!selectedMatch) return;
+
+  const isRevealed = !!selectedMatch.teams_revealed;
+
+  // Header: greeting or match title
+  if (myName) {
+    document.getElementById('pickGreeting').textContent = 'Hey ' + myName + '! 👋';
+  } else {
+    document.getElementById('pickGreeting').textContent = selectedMatch.team1 + ' vs ' + selectedMatch.team2;
+  }
+  document.getElementById('pickSubtitle').textContent =
+    (myName ? selectedMatch.team1 + ' vs ' + selectedMatch.team2 + ' · ' : '') + fmtDate(selectedMatch.match_date);
+
+  document.getElementById('livePot').textContent = '₹' + selectedMatch.pot;
+  document.getElementById('pickProgress').textContent =
+    selectedMatch.picked_count + ' of ' + selectedMatch.total_bettors + ' picked';
+
+  const revealedNotice = document.getElementById('revealedNotice');
+  const alreadyEl      = document.getElementById('alreadyPickedNotice');
+  const pickBtnsEl     = document.getElementById('guestPickButtons');
+
+  if (isRevealed) {
+    revealedNotice.style.display = 'flex';
+    alreadyEl.style.display      = 'none';
+    pickBtnsEl.style.display     = 'none';
+    document.getElementById('pickT1Btn').textContent = selectedMatch.team1;
+    document.getElementById('pickT2Btn').textContent = selectedMatch.team2;
+  } else {
+    revealedNotice.style.display = 'none';
+    document.getElementById('pickT1Btn').textContent = selectedMatch.team1;
+    document.getElementById('pickT2Btn').textContent = selectedMatch.team2;
+    document.getElementById('pickT1Btn').disabled = false;
+    document.getElementById('pickT2Btn').disabled = false;
+    document.getElementById('pickNoneBtn').disabled = false;
+
+    const iHavePicked = selectedMatch.i_have_picked;
+    if (iHavePicked) {
+      pickBtnsEl.style.display = 'none';
+      alreadyEl.style.display  = 'block';
+      const pickLabel = document.getElementById('currentPickLabel');
+      if (pickLabel) pickLabel.textContent = 'Team chosen ✓  — waiting for match result.';
+    } else {
+      alreadyEl.style.display  = 'none';
+      pickBtnsEl.style.display = 'block';
+    }
+  }
+
+  // ── Odds & Stats card ──────────────────────────────────────────────────────
+  let oddsStatsEl = document.getElementById('oddsStatsCard');
+  if (!oddsStatsEl) {
+    oddsStatsEl = document.createElement('div');
+    oddsStatsEl.id = 'oddsStatsCard';
+    oddsStatsEl.style.cssText = 'margin-top:16px;padding:14px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);';
+    // Insert before the "Picked so far" section (last child of pickPanel)
+    const pickPanel = document.getElementById('pickPanel');
+    const pickedSection = pickPanel.querySelector('[style*="border-top"]');
+    if (pickedSection) pickPanel.insertBefore(oddsStatsEl, pickedSection);
+    else pickPanel.appendChild(oddsStatsEl);
+  }
+
+  const t1odds = selectedMatch.team1_odds || 'N/A';
+  const t2odds = selectedMatch.team2_odds || 'N/A';
+  const stats  = selectedMatch.match_stats || {};
+  const t1s    = stats.team1_stats;
+  const t2s    = stats.team2_stats;
+
+  function formBadges(formStr) {
+    if (!formStr || formStr === 'No data') return '<span style="color:var(--text3);font-size:11px;">No data</span>';
+    return formStr.split(' ').map(r =>
+      '<span style="display:inline-block;width:20px;height:20px;line-height:20px;text-align:center;' +
+      'border-radius:4px;font-size:10px;font-weight:700;margin-right:2px;' +
+      (r === 'W'
+        ? 'background:var(--green-bg);color:var(--green);border:1px solid rgba(45,186,135,0.3);'
+        : 'background:rgba(232,91,91,0.1);color:var(--red);border:1px solid rgba(232,91,91,0.2);') +
+      '">' + r + '</span>'
+    ).join('');
+  }
+
+  function teamBlock(teamName, odds, s) {
+    const record = s ? s.wins + 'W / ' + s.losses + 'L' : '—';
+    const form   = s ? formBadges(s.form) : '<span style="color:var(--text3);font-size:11px;">No data</span>';
+    return `
+      <div style="flex:1;min-width:0;">
+        <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;color:var(--text);margin-bottom:6px;">${teamName}</div>
+        <div style="font-size:22px;font-weight:800;font-family:'Syne',sans-serif;color:var(--green);margin-bottom:4px;">${odds}</div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:8px;">win probability</div>
+        <div style="font-size:12px;color:var(--text2);margin-bottom:4px;">Season: <strong style="color:var(--text);">${record}</strong></div>
+        <div style="font-size:11px;color:var(--text3);margin-bottom:4px;">Last 5:</div>
+        <div>${form}</div>
+      </div>`;
+  }
+
+  oddsStatsEl.innerHTML = `
+    <div style="font-size:11px;font-weight:600;color:var(--text3);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:12px;">
+      📊 Team Stats &amp; Odds
+    </div>
+    <div style="display:flex;gap:16px;align-items:flex-start;">
+      ${teamBlock(selectedMatch.team1, t1odds, t1s)}
+      <div style="width:1px;background:var(--border);align-self:stretch;"></div>
+      ${teamBlock(selectedMatch.team2, t2odds, t2s)}
+    </div>
+    <div style="margin-top:10px;font-size:10px;color:var(--text3);text-align:center;">
+      Odds fetched at match open · Stats: IPL 2026 season
+    </div>`;
+  // ── End odds & stats ───────────────────────────────────────────────────────
+
+  renderPickedSoFar();
+
+  const revealBanner = document.getElementById('revealBanner');
+  if (revealBanner) revealBanner.style.display = isRevealed ? 'block' : 'none';
+}
+
+function changePick() {
+  document.getElementById('alreadyPickedNotice').style.display = 'none';
+  document.getElementById('guestPickButtons').style.display    = 'block';
+  document.getElementById('pickT1Btn').disabled   = false;
+  document.getElementById('pickT2Btn').disabled   = false;
+  document.getElementById('pickNoneBtn').disabled = false;
+}
+
+function renderPickedSoFar() {
+  if (!selectedMatch) return;
+  const wrap        = document.getElementById('pickedSoFar');
+  const pickedCount = selectedMatch.picked_count;
+  const total       = selectedMatch.total_bettors;
+  const revealed    = !!selectedMatch.teams_revealed;
+  const picks       = selectedMatch.picks || {};     // populated when revealed
+  const bettors     = selectedMatch.bettors || [];
+  wrap.innerHTML    = '';
+
+  if (revealed && bettors.length) {
+    // Show named chips with their pick
+    bettors.forEach(name => {
+      const pick = picks[name];
+      const chip = document.createElement('div');
+      let pickLabel = '•';
+      let bg = 'var(--surface2)', border = 'var(--border)', color = 'var(--text3)';
+      if (pick === 't1') { pickLabel = selectedMatch.team1; bg = 'var(--green-bg)'; border = 'rgba(45,186,135,0.4)'; color = 'var(--green)'; }
+      if (pick === 't2') { pickLabel = selectedMatch.team2; bg = 'var(--green-bg)'; border = 'rgba(45,186,135,0.4)'; color = 'var(--green)'; }
+      if (pick === 'none') { pickLabel = '🤷'; bg = 'rgba(234,179,8,0.1)'; border = 'rgba(234,179,8,0.3)'; color = '#b45309'; }
+      Object.assign(chip.style, {
+        display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+        padding: '6px 10px', borderRadius: '10px', border: '1px solid ' + border,
+        background: bg, minWidth: '56px', gap: '2px',
+      });
+      chip.innerHTML =
+        '<span style="font-size:11px;color:var(--text3);font-weight:500;">' + name + '</span>' +
+        '<span style="font-size:12px;font-weight:700;color:' + color + ';">' + (pick ? pickLabel : '—') + '</span>';
+      wrap.appendChild(chip);
+    });
+  } else {
+    // Original: anonymous dots
+    for (let i = 0; i < total; i++) {
+      const dot = document.createElement('div');
+      const done = i < pickedCount;
+      Object.assign(dot.style, {
+        width: '36px', height: '36px', borderRadius: '50%',
+        background: done ? 'var(--green-bg)' : 'var(--surface2)',
+        border: '1px solid ' + (done ? 'rgba(45,186,135,0.4)' : 'var(--border)'),
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        fontSize: '16px', color: done ? 'var(--green)' : 'var(--text3)',
+      });
+      dot.textContent = done ? '✓' : '•';
+      wrap.appendChild(dot);
+    }
+  }
+
+  const label = document.createElement('span');
+  Object.assign(label.style, { fontSize: '13px', color: 'var(--text3)', alignSelf: 'center', marginLeft: '4px' });
+  label.textContent = pickedCount === total ? 'Everyone picked! Waiting for result…' :
+                      (total - pickedCount) + ' still to pick';
+  wrap.appendChild(label);
+}
+
+async function submitGuestPick(choice) {
+  if (!myName || !selectedMatch) return;
+
+  const t1Btn   = document.getElementById('pickT1Btn');
+  const t2Btn   = document.getElementById('pickT2Btn');
+  const noneBtn = document.getElementById('pickNoneBtn');
+  t1Btn.disabled = t2Btn.disabled = noneBtn.disabled = true;
+
+  try {
+    const result = await apiFetch('/api/active-matches/' + selectedMatch.id + '/pick', {
+      method: 'POST',
+      body: JSON.stringify({ name: myName, pick: choice }),
+    });
+
+    // Update local match state from pick response
+    selectedMatch.picked_count  = result.picked_count;
+    selectedMatch.pot           = result.pot;
+    selectedMatch.picked_names  = result.picked_names;
+    selectedMatch.i_have_picked = true;
+
+    // Re-fetch the full match so picks/teams_revealed are up to date
+    try {
+      const qs = '?name=' + encodeURIComponent(myName);
+      const matches = await apiFetch('/api/active-matches' + qs);
+      const fresh = matches.find(m => m.id === selectedMatch.id);
+      if (fresh) selectedMatch = fresh;
+    } catch (_) {}
+
+    // Show already-picked state — only "Team chosen ✓", not which team
+    const pickBtnsEl = document.getElementById('guestPickButtons');
+    const alreadyEl  = document.getElementById('alreadyPickedNotice');
+    pickBtnsEl.style.display = 'none';
+    alreadyEl.style.display  = 'block';
+
+    const pickLabel = document.getElementById('currentPickLabel');
+    if (pickLabel) {
+      if (choice === 'none') pickLabel.textContent = 'You chose to abstain this match.';
+      else                   pickLabel.textContent = 'Team chosen ✓  — waiting for match result.';
+    }
+
+    document.getElementById('livePot').textContent = '₹' + result.pot;
+    document.getElementById('pickProgress').textContent =
+      result.picked_count + ' of ' + result.total_bettors + ' picked';
+    renderPickedSoFar();
+
+    const verb = result.is_change ? 'updated' : 'locked in';
+    showAlert(myName + '! Your pick is ' + verb + ' 🔒', 'success');
+  } catch (e) {
+    showAlert('Error: ' + e.message, 'error');
+    t1Btn.disabled = t2Btn.disabled = noneBtn.disabled = false;
+  }
+}
+
+/* ── Poll to refresh pot / pick count for guests ────────────────────────── */
+setInterval(async () => {
+  if (currentRole !== 'guest' || !selectedMatch) return;
+  try {
+    const qs      = myName ? '?name=' + encodeURIComponent(myName) : '';
+    const matches = await apiFetch('/api/active-matches' + qs);
+    const fresh   = matches.find(m => m.id === selectedMatch.id);
+    if (!fresh) return;
+    const wasRevealed = selectedMatch.teams_revealed;
+    selectedMatch = fresh;
+
+    // If teams just got revealed while user is on identity or pick panel, transition
+    if (!wasRevealed && fresh.teams_revealed) {
+      showGuestStep('pickPanel');
+      renderPickPanel();
+      return;
+    }
+
+    const pickPanel = document.getElementById('pickPanel');
+    if (!pickPanel || pickPanel.style.display === 'none') return;
+    document.getElementById('livePot').textContent = '₹' + fresh.pot;
+    document.getElementById('pickProgress').textContent =
+      fresh.picked_count + ' of ' + fresh.total_bettors + ' picked';
+    renderPickedSoFar();
+    const revealBanner = document.getElementById('revealBanner');
+    if (revealBanner) revealBanner.style.display = fresh.teams_revealed ? 'block' : 'none';
+    const revealedNotice = document.getElementById('revealedNotice');
+    if (revealedNotice) revealedNotice.style.display = fresh.teams_revealed ? 'flex' : 'none';
+  } catch (_) {}
+}, 4000);
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   ADMIN BET FLOW
+══════════════════════════════════════════════════════════════════════════════ */
+
+async function renderAdminBetTab() {
+  try {
+    activeMatches = await apiFetch('/api/active-matches');
+  } catch (_) { activeMatches = []; }
+  renderAdminMatchList();
+}
+
+function renderAdminMatchList() {
+  const container = document.getElementById('adminActiveMatchList');
+  if (!activeMatches.length) {
+    container.innerHTML = '';
+    return;
+  }
+
+  container.innerHTML = activeMatches.map(m => {
+    const picks   = m.picks || {};
+    const bettors = m.bettors || [];
+    const winner  = adminWinners[m.id] || null;
+
+    const pickRows = bettors.map(name => {
+      const pick = picks[name];
+      let tag = '<span style="color:var(--text3);font-size:12px;">Not picked yet</span>';
+      if (pick === 't1') tag = '<span class="pick-tag green">' + m.team1 + '</span>';
+      if (pick === 't2') tag = '<span class="pick-tag green">' + m.team2 + '</span>';
+      if (pick === 'none') tag = '<span class="pick-tag amber">Abstain</span>';
+      return '<div class="pick-row" style="grid-template-columns:80px 1fr;">' +
+             '<div class="pick-name">' + name + '</div>' + tag + '</div>';
+    }).join('');
+
+    const winBtns = [
+      { val: 't1', label: m.team1 },
+      { val: 't2', label: m.team2 },
+    ].map(b =>
+      '<button class="win-btn' + (winner === b.val ? ' selected' : '') + '" ' +
+      'onclick="setAdminWinner(' + m.id + ', \'' + b.val + '\')">' + b.label + '</button>'
+    ).join('');
+
+    const isRevealed = !!m.teams_revealed;
+    const revealBtnLabel = isRevealed ? '🙈 Hide Teams' : '👁 Reveal Teams';
+    const revealBtnStyle = isRevealed
+      ? 'background:var(--green-bg);color:var(--green);border:1px solid rgba(45,186,135,0.4);'
+      : 'background:var(--surface2);color:var(--text2);border:1px solid var(--border);';
+
+    return `
+      <div class="card" style="margin-bottom:16px;" id="adminMatch-${m.id}">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+          <div>
+            <div style="font-family:'Syne',sans-serif;font-size:17px;font-weight:700;color:var(--text);">
+              ${m.team1} <span style="color:var(--text3)">vs</span> ${m.team2}
+            </div>
+            <div style="font-size:12px;color:var(--text3);">${fmtDate(m.match_date)}</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button style="padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;transition:all 0.2s;${revealBtnStyle}"
+              onclick="toggleRevealTeams(${m.id}, ${!isRevealed})">${revealBtnLabel}</button>
+            <button class="del-btn" onclick="cancelActiveMatch(${m.id})">Cancel</button>
+          </div>
+        </div>
+
+        <div class="pot-bar" style="margin-bottom:14px;">
+          <span class="pot-text">🫙 Pot</span>
+          <span class="pot-amount">₹${m.pot}</span>
+          <span class="pot-text" style="font-size:12px;">${m.picked_count}/${m.total_bettors} picked</span>
+        </div>
+
+        <div class="pick-grid" style="margin-bottom:16px;">${pickRows}</div>
+
+        <div style="border-top:1px solid var(--border);padding-top:14px;">
+          <label class="field-label" style="margin-bottom:10px;">Actual winner</label>
+          <div class="winner-row">${winBtns}</div>
+          <div class="action-row" style="margin-top:14px;">
+            <button class="btn-primary" onclick="finalizeMatch(${m.id})">Finalize &amp; Record</button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function setAdminWinner(matchId, val) {
+  adminWinners[matchId] = val;
+  renderAdminMatchList();
+}
+
+function toggleMember(btn) { btn.classList.toggle('on'); }
+
+function getActiveBettors() {
+  return [...document.querySelectorAll('#memberToggles .toggle-btn.on')].map(b => b.dataset.name);
+}
+
+async function openNewMatch() {
+  const t1      = document.getElementById('team1').value.trim();
+  const t2      = document.getElementById('team2').value.trim();
+  const date    = document.getElementById('matchDate').value;
+  const bettors = getActiveBettors();
+  if (!t1 || !t2)       return showAlert('Enter both team names.', 'error');
+  if (!bettors.length)  return showAlert('Select at least one bettor.', 'error');
+
+  try {
+    const newMatch = await apiFetch('/api/active-matches', {
+      method: 'POST',
+      body: JSON.stringify({ team1: t1, team2: t2, match_date: date, bettors }),
+    });
+    activeMatches.push(newMatch);
+    document.getElementById('team1').value = '';
+    document.getElementById('team2').value = '';
+    renderAdminMatchList();
+    showAlert('Match opened: ' + t1 + ' vs ' + t2 + ' 🏏', 'success');
+  } catch (e) { showAlert('Error: ' + e.message, 'error'); }
+}
+
+async function finalizeMatch(matchId) {
+  const winner = adminWinners[matchId];
+  if (!winner) return showAlert('Select the actual winner first.', 'error');
+
+  try {
+    const result = await apiFetch('/api/active-matches/' + matchId + '/finalize', {
+      method: 'POST',
+      body: JSON.stringify({ winner_team: winner }),
+    });
+    activeMatches = activeMatches.filter(m => m.id !== matchId);
+    delete adminWinners[matchId];
+    renderAdminMatchList();
+    await loadStats();
+    const wName   = result.winner_name;
+    const winners = result.bettors.filter(m => result.picks[m] === result.winner_team);
+    showAlert(
+      wName !== '—'
+        ? 'Recorded! ' + wName + ' won · ' + winners.join(' & ') + ' split ₹' + result.pot + ' 🎉'
+        : 'Recorded — no winners this round.',
+      'success'
+    );
+  } catch (e) { showAlert('Error: ' + e.message, 'error'); }
+}
+
+async function cancelActiveMatch(matchId) {
+  if (!confirm('Cancel this match? Picks will be lost.')) return;
+  try {
+    await apiFetch('/api/active-matches/' + matchId, { method: 'DELETE' });
+    activeMatches = activeMatches.filter(m => m.id !== matchId);
+    delete adminWinners[matchId];
+    renderAdminMatchList();
+    showAlert('Match cancelled.', 'success');
+  } catch (e) { showAlert('Error: ' + e.message, 'error'); }
+}
+
+async function toggleRevealTeams(matchId, reveal) {
+  try {
+    await apiFetch('/api/active-matches/' + matchId + '/reveal', {
+      method: 'PATCH',
+      body: JSON.stringify({ revealed: reveal }),
+    });
+    const m = activeMatches.find(x => x.id === matchId);
+    if (m) m.teams_revealed = reveal;
+    renderAdminMatchList();
+    showAlert(reveal ? '👁 Teams revealed to all players.' : '🙈 Teams hidden from players.', 'success');
+  } catch (e) { showAlert('Error: ' + e.message, 'error'); }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   HISTORY
+══════════════════════════════════════════════════════════════════════════════ */
+async function renderHistory() {
+  const card = document.getElementById('historyCard');
+  card.innerHTML = '<div class="empty"><span class="spinner"></span>Loading…</div>';
+  let matches;
+  try { matches = await apiFetch('/api/matches'); }
+  catch (e) {
+    card.innerHTML = '<div class="empty"><span class="empty-icon">⚠️</span>Failed: ' + e.message + '</div>';
+    return;
+  }
+  if (!matches.length) {
+    card.innerHTML = '<div class="empty"><span class="empty-icon">🏏</span>No matches yet</div>';
+    return;
+  }
+  const totals = {};
+  allMembers.forEach(m => totals[m] = 0);
+  matches.slice().reverse().forEach(match => {
+    match.bettors.forEach(m => { totals[m] = (totals[m] || 0) + match.payouts[m]; });
+  });
+  const isAdmin    = currentRole === 'admin';
+  const memberCols = allMembers.map(m => '<th>' + m + '</th>').join('');
+  const totalsRow  = allMembers.map(m => {
+    const n   = Math.round(totals[m] || 0);
+    const cls = n > 0 ? 'cell-won' : n < 0 ? 'cell-lost' : 'cell-neutral';
+    return '<td class="' + cls + '">' + (n >= 0 ? '+' : '') + '₹' + Math.abs(n) + '</td>';
+  }).join('');
+
+  const rows = matches.map(match => {
+    const dateStr = match.match_date
+      ? new Date(match.match_date + 'T00:00:00').toLocaleDateString('en-IN', {day:'numeric',month:'short'})
+      : '—';
+    const matchLabel  = match.team1 + ' vs ' + match.team2;
+    const winnerLabel = match.winner_name;
+    const memberCells = allMembers.map(m => {
+      if (!match.bettors.includes(m)) return '<td class="cell-neutral">—</td>';
+      const n   = match.payouts[m];
+      const cls = n > 0 ? 'cell-won' : n < 0 ? 'cell-lost' : 'cell-neutral';
+      return '<td class="' + cls + '">' + fmtAmount(n) + '</td>';
+    }).join('');
+    const delCell = isAdmin
+      ? '<td><button class="del-btn" onclick="deleteMatch(' + match.id + ')">✕</button></td>'
+      : '<td></td>';
+    return '<tr><td><div class="match-name">' + matchLabel + '</div>' +
+           '<div class="match-date">' + dateStr + '</div>' +
+           '<span class="winner-tag">' + winnerLabel + '</span></td>' +
+           memberCells + delCell + '</tr>';
+  }).join('');
+
+  card.innerHTML =
+    '<div class="table-wrap"><table>' +
+    '<thead><tr><th>Match</th>' + memberCols + '<th></th></tr></thead>' +
+    '<tbody>' + rows + '</tbody>' +
+    '<tfoot><tr class="totals-row"><td>Season Total</td>' + totalsRow + '<td></td></tr></tfoot>' +
+    '</table></div>';
+}
+
+/* ══════════════════════════════════════════════════════════════════════════════
+   LEADERBOARD
+══════════════════════════════════════════════════════════════════════════════ */
+async function renderLeaderboard() {
+  const lbCard = document.getElementById('lbCard');
+  lbCard.innerHTML = '<div class="empty"><span class="spinner"></span>Loading…</div>';
+  let stats;
+  try { stats = await apiFetch('/api/stats'); }
+  catch (e) {
+    lbCard.innerHTML = '<div class="empty"><span class="empty-icon">⚠️</span>Failed: ' + e.message + '</div>';
+    return;
+  }
+  const lb = stats.leaderboard;
+  if (!lb || !lb.length || stats.total_matches === 0) {
+    lbCard.innerHTML = '<div class="empty"><span class="empty-icon">🏆</span>No data yet</div>';
+    return;
+  }
+  const maxAbs = Math.max(1, ...lb.map(x => Math.abs(x.net)));
+  const medals = ['🥇', '🥈', '🥉', ''];
+  const items  = lb.map((item, i) => {
+    const pct    = Math.max(4, Math.round(Math.abs(item.net) / maxAbs * 100));
+    const sign   = item.net >= 0 ? '+' : '';
+    const amtCls = item.net > 0 ? 'pos' : item.net < 0 ? 'neg' : 'zero';
+    const barCls = item.net < 0 ? 'neg' : '';
+    return '<div class="lb-item' + (i === 0 ? ' first' : '') + '">' +
+      '<div class="lb-rank' + (i === 0 ? ' gold' : '') + '">' + (medals[i] || (i+1)) + '</div>' +
+      '<div class="lb-avatar">' + item.name.slice(0,2).toUpperCase() + '</div>' +
+      '<div style="flex:1;"><div class="lb-name">' + item.name + '</div>' +
+      '<div class="lb-games">' + item.games + ' match' + (item.games !== 1 ? 'es' : '') + '</div></div>' +
+      '<div class="lb-bar-wrap"><div class="lb-bar ' + barCls + '" style="width:' + pct + '%"></div></div>' +
+      '<div class="lb-amount ' + amtCls + '">' + sign + '₹' + Math.abs(item.net) + '</div></div>';
+  }).join('');
+
+  const summaryRows = lb.map(item => {
+    const sign = item.net >= 0 ? '+' : '';
+    const cls  = item.net > 0 ? 'cell-won' : item.net < 0 ? 'cell-lost' : 'cell-neutral';
+    return '<tr><td><strong>' + item.name + '</strong></td><td>' + item.games + '</td>' +
+           '<td class="cell-won">' + item.wins + '</td><td class="cell-lost">' + item.losses + '</td>' +
+           '<td>' + (item.win_pct > 0 ? item.win_pct + '%' : '—') + '</td>' +
+           '<td class="' + cls + '">' + sign + '₹' + Math.abs(item.net) + '</td></tr>';
+  }).join('');
+
+  lbCard.innerHTML =
+    '<div class="lb-list" style="margin-bottom:20px;">' + items + '</div>' +
+    '<div class="card"><div class="card-title">Season Stats</div>' +
+    '<div class="table-wrap"><table><thead><tr>' +
+    '<th>Name</th><th>Played</th><th>Wins</th><th>Losses</th><th>Win %</th><th>Net</th>' +
+    '</tr></thead><tbody>' + summaryRows + '</tbody></table></div></div>';
+}
+
+/* ── Helpers ─────────────────────────────────────────────────────────────── */
+function showAlert(msg, type) {
+  const box = document.getElementById('alertBox');
+  box.textContent = msg;
+  box.className = 'alert ' + type;
+  clearTimeout(box._timer);
+  box._timer = setTimeout(() => { box.className = 'alert'; }, 5000);
+}
+
+function fmtAmount(n) {
+  const abs = Math.abs(Math.round(n));
+  return (n >= 0 ? '+' : '-') + '₹' + abs;
+}
+
+function fmtDate(d) {
+  if (!d) return '—';
+  return new Date(d + 'T00:00:00').toLocaleDateString('en-IN', {day:'numeric', month:'short', year:'numeric'});
+}
+
+async function deleteMatch(id) {
+  if (currentRole !== 'admin') return showAlert('Admin access required.', 'error');
+  if (!confirm('Delete this match?')) return;
+  try {
+    await apiFetch('/api/matches/' + id, { method: 'DELETE' });
+    await loadStats();
+    renderHistory();
+  } catch (e) { showAlert('Delete failed: ' + e.message, 'error'); }
+}
+
+async function clearAll() {
+  if (!confirm('Delete ALL match data? Cannot be undone.')) return;
+  try {
+    await apiFetch('/api/matches/clear', { method: 'DELETE' });
+    showAlert('All data cleared.', 'success');
+    await loadStats();
+  } catch (e) { showAlert('Error: ' + e.message, 'error'); }
+}
+
+/* ── Auth / Login Modal ──────────────────────────────────────────────────── */
+function openLoginModal() {
+  document.getElementById('loginOverlay').classList.add('open');
+  document.getElementById('adminPassword').value = '';
+  const a = document.getElementById('loginAlert');
+  a.textContent = ''; a.className = 'alert';
+  setTimeout(() => document.getElementById('adminPassword').focus(), 100);
+}
+
+function closeLoginModal(e) {
+  if (e && e.target !== document.getElementById('loginOverlay')) return;
+  document.getElementById('loginOverlay').classList.remove('open');
+}
+
+async function submitLogin() {
+  const pw  = document.getElementById('adminPassword').value;
+  const btn = document.getElementById('loginBtn');
+  if (!pw) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Checking…';
+  const alertEl = document.getElementById('loginAlert');
+  alertEl.textContent = ''; alertEl.className = 'alert';
+
+  try {
+    await apiFetch('/api/login', { method: 'POST', body: JSON.stringify({ password: pw }) });
+    currentRole = 'admin';
+    await applyRoleUI();
+    document.getElementById('loginOverlay').classList.remove('open');
+    showAlert('Logged in as admin ⚡', 'success');
+  } catch (e) {
+    alertEl.textContent = e.message || 'Invalid password';
+    alertEl.className   = 'alert error';
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Login';
+  }
+}
+
+async function doLogout() {
+  try { await apiFetch('/api/logout', { method: 'POST' }); } catch (_) {}
+  currentRole   = 'guest';
+  myName        = null;
+  selectedMatch = null;
+  activeMatches = [];
+  adminWinners  = {};
+  await applyRoleUI();
+  showAlert('Logged out.', 'success');
+}

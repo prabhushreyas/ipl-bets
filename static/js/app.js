@@ -282,47 +282,27 @@ function renderPickPanel() {
 
   const t1odds = selectedMatch.team1_odds || 'N/A';
   const t2odds = selectedMatch.team2_odds || 'N/A';
-  const stats  = selectedMatch.match_stats || {};
-  const t1s    = stats.team1_stats;
-  const t2s    = stats.team2_stats;
 
-  function formBadges(formStr) {
-    if (!formStr || formStr === 'No data') return '<span style="color:var(--text3);font-size:11px;">No data</span>';
-    return formStr.split(' ').map(r =>
-      '<span style="display:inline-block;width:20px;height:20px;line-height:20px;text-align:center;' +
-      'border-radius:4px;font-size:10px;font-weight:700;margin-right:2px;' +
-      (r === 'W'
-        ? 'background:var(--green-bg);color:var(--green);border:1px solid rgba(45,186,135,0.3);'
-        : 'background:rgba(232,91,91,0.1);color:var(--red);border:1px solid rgba(232,91,91,0.2);') +
-      '">' + r + '</span>'
-    ).join('');
-  }
-
-  function teamBlock(teamName, odds, s) {
-    const record = s ? s.wins + 'W / ' + s.losses + 'L' : '—';
-    const form   = s ? formBadges(s.form) : '<span style="color:var(--text3);font-size:11px;">No data</span>';
+  function teamBlock(teamName, odds) {
     return `
-      <div style="flex:1;min-width:0;">
+      <div style="flex:1;min-width:0;text-align:center;">
         <div style="font-family:'Syne',sans-serif;font-weight:700;font-size:14px;color:var(--text);margin-bottom:6px;">${teamName}</div>
-        <div style="font-size:22px;font-weight:800;font-family:'Syne',sans-serif;color:var(--green);margin-bottom:4px;">${odds}</div>
-        <div style="font-size:11px;color:var(--text3);margin-bottom:8px;">win probability</div>
-        <div style="font-size:12px;color:var(--text2);margin-bottom:4px;">Season: <strong style="color:var(--text);">${record}</strong></div>
-        <div style="font-size:11px;color:var(--text3);margin-bottom:4px;">Last 5:</div>
-        <div>${form}</div>
+        <div style="font-size:26px;font-weight:800;font-family:'Syne',sans-serif;color:var(--green);margin-bottom:4px;">${odds}</div>
+        <div style="font-size:11px;color:var(--text3);">win probability</div>
       </div>`;
   }
 
   oddsStatsEl.innerHTML = `
     <div style="font-size:11px;font-weight:600;color:var(--text3);letter-spacing:0.05em;text-transform:uppercase;margin-bottom:12px;">
-      📊 Team Stats &amp; Odds
+      📊 Win Odds
     </div>
-    <div style="display:flex;gap:16px;align-items:flex-start;">
-      ${teamBlock(selectedMatch.team1, t1odds, t1s)}
+    <div style="display:flex;gap:16px;align-items:center;">
+      ${teamBlock(selectedMatch.team1, t1odds)}
       <div style="width:1px;background:var(--border);align-self:stretch;"></div>
-      ${teamBlock(selectedMatch.team2, t2odds, t2s)}
+      ${teamBlock(selectedMatch.team2, t2odds)}
     </div>
     <div style="margin-top:10px;font-size:10px;color:var(--text3);text-align:center;">
-      Odds fetched at match open · Stats: IPL 2026 season
+      Odds fetched at match open
     </div>`;
   // ── End odds & stats ───────────────────────────────────────────────────────
 
